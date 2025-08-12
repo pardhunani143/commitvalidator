@@ -51,8 +51,8 @@ func prWebhookHandler(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // Only handle PR events with action 'opened'
-    if prEvent.Action != "opened" {
+    // Only handle PR events with action 'opened' or 'reopened'
+    if prEvent.Action != "opened" && prEvent.Action != "reopened" {
         log.Printf("Ignoring PR event with action: %s", prEvent.Action)
         fmt.Fprintf(w, "Ignoring PR event with action: %s", prEvent.Action)
         return
@@ -83,6 +83,104 @@ func prWebhookHandler(w http.ResponseWriter, r *http.Request) {
     for _, f := range files {
         log.Printf("- %s (additions: %d, deletions: %d, changes: %d)", f.Filename, f.Additions, f.Deletions, f.Changes)
     }
+
+        // --- Enhanced Reporting ---
+        // Generic detection of changed apps, modules, and files
+        type ChangedFile struct {
+            AppName    string
+            ModuleName string
+            FileName   string
+            PRFile     PRFile
+        }
+        var changedFiles []ChangedFile
+        var changedAppsMap = make(map[string]bool)
+        var appsJsonPatch string
+        for _, f := range files {
+            // Detect apps.json diff
+            if f.Filename == "apps.json" {
+                appsJsonPatch = f.Patch
+                continue
+            }
+            // Expect structure: appname/moduleName/filename
+            parts := bytes.Split([]byte(f.Filename), []byte("/"))
+            if len(parts) >= 3 {
+                appName := string(parts[0])
+                moduleName := string(parts[1])
+                fileName := string(parts[2])
+                changedFiles = append(changedFiles, ChangedFile{
+                    AppName: appName,
+                    ModuleName: moduleName,
+                    FileName: fileName,
+                    PRFile: f,
+                })
+                changedAppsMap[appName] = true
+            }
+        }
+        var changedApps []string
+        for app := range changedAppsMap {
+            changedApps = append(changedApps, app)
+        }
+        if len(changedApps) > 0 {
+            log.Printf("Apps changed in PR: %v", changedApps)
+            fmt.Fprintf(w, "Apps changed in PR: %v\n", changedApps)
+            log.Printf("Changed modules and files:")
+            fmt.Fprintf(w, "Changed modules and files:\n")
+            for _, cf := range changedFiles {
+                log.Printf("- %s/%s/%s (additions: %d, deletions: %d, changes: %d)", cf.AppName, cf.ModuleName, cf.FileName, cf.PRFile.Additions, cf.PRFile.Deletions, cf.PRFile.Changes)
+                fmt.Fprintf(w, "- %s/%s/%s (additions: %d, deletions: %d, changes: %d)\n", cf.AppName, cf.ModuleName, cf.FileName, cf.PRFile.Additions, cf.PRFile.Deletions, cf.PRFile.Changes)
+            }
+        }
+        if appsJsonPatch != "" {
+            log.Printf("apps.json changes:\n%s", appsJsonPatch)
+            fmt.Fprintf(w, "apps.json changes:\n%s\n", appsJsonPatch)
+
+            // Try to parse the new apps.json from disk
+            type App struct {
+                Name            string   `json:"name"`
+                CMDBWhitelists  []map[string]string `json:"cmdb_whitelists"`
+                CMDBBlacklists  []map[string]string `json:"cmdb_blacklists"`
+                Whitelists      []string `json:"whitelists"`
+                Blacklists      []string `json:"blacklists"`
+            }
+            type AppsJson struct {
+                Apps []App `json:"apps"`
+            }
+            var newAppsJson AppsJson
+            appsJsonBytes, err := ioutil.ReadFile("/home/pardha/go/testcommit/apps.json")
+            if err == nil {
+                json.Unmarshal(appsJsonBytes, &newAppsJson)
+            }
+
+            // For each app, print impacted servers (whitelist + cmdb_whitelist - blacklist - cmdb_blacklist)
+            for _, app := range newAppsJson.Apps {
+                impactedServers := make(map[string]bool)
+                // Add whitelists
+                for _, s := range app.Whitelists {
+                    impactedServers[s] = true
+                }
+                // Add cmdb_whitelists
+                for _, m := range app.CMDBWhitelists {
+                    for _, v := range m {
+                        impactedServers[v] = true
+                    }
+                }
+                // Remove blacklists
+                for _, s := range app.Blacklists {
+                    delete(impactedServers, s)
+                }
+                // Remove cmdb_blacklists
+                for _, m := range app.CMDBBlacklists {
+                    for _, v := range m {
+                        delete(impactedServers, v)
+                    }
+                }
+                // Print per app
+                log.Printf("App: %s", app.Name)
+                fmt.Fprintf(w, "App: %s\n", app.Name)
+                log.Printf("Impacted servers: %v", impactedServers)
+                fmt.Fprintf(w, "Impacted servers: %v\n", impactedServers)
+            }
+        }
 
     // --- PR Validation Logic ---
     validationPassed := validatePR(files)
@@ -122,7 +220,7 @@ func validatePR(files []PRFile) bool {
             return false
         }
     }
-    return false
+    return true
 }
 
 // updatePRStatus posts a status to the PR using the GitHub API
