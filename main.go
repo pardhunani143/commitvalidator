@@ -182,27 +182,75 @@ func prWebhookHandler(w http.ResponseWriter, r *http.Request) {
             }
         }
 
-    // --- PR Validation Logic ---
-    validationPassed := validatePR(files)
+    // --- Enhanced PR Validation Logic ---
+    onlyAppsJsonChanged := false
+    changedAppModules := make(map[string][]string)
+    for _, f := range files {
+        if f.Filename == "apps.json" {
+            onlyAppsJsonChanged = true
+        } else {
+            parts := bytes.Split([]byte(f.Filename), []byte("/"))
+            if len(parts) >= 3 {
+                appName := string(parts[0])
+                moduleName := string(parts[1])
+                changedAppModules[appName] = append(changedAppModules[appName], moduleName)
+                onlyAppsJsonChanged = false
+            }
+        }
+    }
+
     status := "success"
     description := "PR validation passed."
-    if !validationPassed {
-        status = "failure"
-        description = "PR validation failed."
+    comment := ""
+
+    if onlyAppsJsonChanged && len(changedAppModules) == 0 {
+        status = "success"
+        description = "Only apps.json changed, no app changes."
+        comment = "Only apps.json changed, no app changes."
+    } else {
+        // Check if any module is fluent_bit
+        fluentBitFound := false
+        for _, modules := range changedAppModules {
+            for _, m := range modules {
+                if m == "fluent-bit" {
+                    fluentBitFound = true
+                    break
+                }
+            }
+            if fluentBitFound {
+                break
+            }
+        }
+        if fluentBitFound {
+            // Validate PR for fluent_bit modules
+            validationPassed := validatePR(files)
+            if validationPassed {
+                status = "success"
+                description = "PR validation passed for fluent_bit module."
+                comment = "PR validation passed for fluent_bit module."
+            } else {
+                status = "failure"
+                description = "PR validation failed for fluent_bit module."
+                comment = "PR rejected: validation failed for fluent_bit module."
+            }
+        } else {
+            // No fluent_bit modules updated
+            status = "success"
+            description = "Modules updated do not belong to fluent_bit, validation skipped."
+            comment = "Modules updated do not belong to fluent_bit, validation skipped."
+        }
     }
-    // Update PR status on GitHub (optional: close PR if failed)
+
+    // Update PR status on GitHub (do not close PR if failed)
     err = updatePRStatus(owner, repo, prNumber, status, description)
     if err != nil {
         log.Printf("Error updating PR status: %v", err)
     }
-    // Optionally close PR if validation failed
-    if !validationPassed {
-        err = closePullRequest(owner, repo, prNumber)
-        if err != nil {
-            log.Printf("Error closing PR: %v", err)
-        } else {
-            log.Printf("PR #%d closed due to failed validation.", prNumber)
-        }
+    // Optionally add a comment to the PR (implement addPRComment if needed)
+    if comment != "" {
+        
+        // addPRComment(owner, repo, prNumber, comment) // Uncomment and implement if you want to post comments
+        log.Printf("PR #%d comment: %s", prNumber, comment)
     }
     fmt.Fprintf(w, "PR #%d validation complete. Status: %s\n", prNumber, status)
     fmt.Fprintf(w, "Files changed in PR:\n")
@@ -220,7 +268,7 @@ func validatePR(files []PRFile) bool {
             return false
         }
     }
-    return true
+    return false
 }
 
 // updatePRStatus posts a status to the PR using the GitHub API
