@@ -1,3 +1,4 @@
+
 package main
 
 import (
@@ -10,6 +11,26 @@ import (
     "bytes"
 )
 
+// App represents an app config in apps.json
+type App struct {
+    Name            string   `json:"name"`
+    CMDBWhitelists  []map[string]string `json:"cmdb_whitelists"`
+    CMDBBlacklists  []map[string]string `json:"cmdb_blacklists"`
+    Whitelists      []string `json:"whitelists"`
+    Blacklists      []string `json:"blacklists"`
+}
+
+// AppsJson represents the structure of apps.json
+type AppsJson struct {
+    Apps []App `json:"apps"`
+}
+
+// Helper to compare two App configs
+func appConfigEqual(a, b App) bool {
+    aBytes, _ := json.Marshal(a)
+    bBytes, _ := json.Marshal(b)
+    return bytes.Equal(aBytes, bBytes)
+}
 func prWebhookHandler(w http.ResponseWriter, r *http.Request) {
     var payload []byte
     if r.Header.Get("Content-Type") == "application/x-www-form-urlencoded" {
@@ -134,53 +155,104 @@ func prWebhookHandler(w http.ResponseWriter, r *http.Request) {
             log.Printf("apps.json changes:\n%s", appsJsonPatch)
             fmt.Fprintf(w, "apps.json changes:\n%s\n", appsJsonPatch)
 
-            // Try to parse the new apps.json from disk
-            type App struct {
-                Name            string   `json:"name"`
-                CMDBWhitelists  []map[string]string `json:"cmdb_whitelists"`
-                CMDBBlacklists  []map[string]string `json:"cmdb_blacklists"`
-                Whitelists      []string `json:"whitelists"`
-                Blacklists      []string `json:"blacklists"`
-            }
-            type AppsJson struct {
-                Apps []App `json:"apps"`
-            }
-            var newAppsJson AppsJson
-            appsJsonBytes, err := ioutil.ReadFile("/home/pardha/go/testcommit/apps.json")
-            if err == nil {
-                json.Unmarshal(appsJsonBytes, &newAppsJson)
+            var prAppsJson, mainAppsJson AppsJson
+
+            // Helper to fetch file from GitHub API
+            fetchFileFromBranch := func(owner, repo, path, ref, token string) ([]byte, error) {
+                url := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/%s?ref=%s", owner, repo, path, ref)
+                req, err := http.NewRequest("GET", url, nil)
+                if err != nil {
+                    return nil, err
+                }
+                if token != "" {
+                    req.Header.Set("Authorization", "token "+token)
+                }
+                req.Header.Set("Accept", "application/vnd.github.v3.raw")
+                client := &http.Client{}
+                resp, err := client.Do(req)
+                if err != nil {
+                    return nil, err
+                }
+                defer resp.Body.Close()
+                if resp.StatusCode != 200 {
+                    body, _ := ioutil.ReadAll(resp.Body)
+                    return nil, fmt.Errorf("GitHub API error: %s", string(body))
+                }
+                return ioutil.ReadAll(resp.Body)
             }
 
-            // For each app, print impacted servers (whitelist + cmdb_whitelist - blacklist - cmdb_blacklist)
-            for _, app := range newAppsJson.Apps {
-                impactedServers := make(map[string]bool)
-                // Add whitelists
-                for _, s := range app.Whitelists {
-                    impactedServers[s] = true
-                }
-                // Add cmdb_whitelists
-                for _, m := range app.CMDBWhitelists {
-                    for _, v := range m {
-                        impactedServers[v] = true
-                    }
-                }
-                // Remove blacklists
-                for _, s := range app.Blacklists {
-                    delete(impactedServers, s)
-                }
-                // Remove cmdb_blacklists
-                for _, m := range app.CMDBBlacklists {
-                    for _, v := range m {
-                        delete(impactedServers, v)
-                    }
-                }
-                // Print per app
-                log.Printf("App: %s", app.Name)
-                fmt.Fprintf(w, "App: %s\n", app.Name)
-                log.Printf("Impacted servers: %v", impactedServers)
-                fmt.Fprintf(w, "Impacted servers: %v\n", impactedServers)
+            token := os.Getenv("GITHUB_TOKEN")
+            // prRef removed (was unused)
+            prBranch := fmt.Sprintf("refs/pull/%d/head", prNumber)
+            mainBranch := "main"
+
+            prAppsBytes, err := fetchFileFromBranch(owner, repo, "apps.json", prBranch, token)
+            if err == nil {
+                json.Unmarshal(prAppsBytes, &prAppsJson)
+            } else {
+                log.Printf("Error fetching apps.json from PR branch: %v", err)
             }
-        }
+            mainAppsBytes, err := fetchFileFromBranch(owner, repo, "apps.json", mainBranch, token)
+            if err == nil {
+                json.Unmarshal(mainAppsBytes, &mainAppsJson)
+            } else {
+                log.Printf("Error fetching apps.json from main branch: %v", err)
+            }
+
+            // Only report apps with config changes
+            type appDiff struct {
+                Name string
+                PRConfig App
+                MainConfig App
+            }
+            var impactedApps []appDiff
+            // Build map for main branch apps for quick lookup
+            mainAppsMap := make(map[string]App)
+            for _, app := range mainAppsJson.Apps {
+                mainAppsMap[app.Name] = app
+            }
+            for _, prApp := range prAppsJson.Apps {
+                mainApp, exists := mainAppsMap[prApp.Name]
+                if !exists || !appConfigEqual(prApp, mainApp) {
+                    impactedApps = append(impactedApps, appDiff{
+                        Name: prApp.Name,
+                        PRConfig: prApp,
+                        MainConfig: mainApp,
+                    })
+                }
+            }
+            if len(impactedApps) == 0 {
+                log.Printf("No apps impacted by apps.json changes.")
+                fmt.Fprintf(w, "No apps impacted by apps.json changes.\n")
+            } else {
+                log.Printf("Apps impacted by apps.json changes:")
+                fmt.Fprintf(w, "Apps impacted by apps.json changes:\n")
+                for _, diff := range impactedApps {
+                    log.Printf("- %s", diff.Name)
+                    fmt.Fprintf(w, "- %s\n", diff.Name)
+                    // Print impacted servers for this app (from PR config)
+                    impactedServers := make(map[string]bool)
+                    for _, s := range diff.PRConfig.Whitelists {
+                        impactedServers[s] = true
+                    }
+                    for _, m := range diff.PRConfig.CMDBWhitelists {
+                        for _, v := range m {
+                            impactedServers[v] = true
+                        }
+                    }
+                    for _, s := range diff.PRConfig.Blacklists {
+                        delete(impactedServers, s)
+                    }
+                    for _, m := range diff.PRConfig.CMDBBlacklists {
+                        for _, v := range m {
+                            delete(impactedServers, v)
+                        }
+                    }
+                    log.Printf("  Impacted servers: %v", impactedServers)
+                    fmt.Fprintf(w, "  Impacted servers: %v\n", impactedServers)
+                }
+            }
+    }
 
     // --- Enhanced PR Validation Logic ---
     onlyAppsJsonChanged := false
@@ -248,7 +320,7 @@ func prWebhookHandler(w http.ResponseWriter, r *http.Request) {
     }
     // Optionally add a comment to the PR (implement addPRComment if needed)
     if comment != "" {
-        
+
         // addPRComment(owner, repo, prNumber, comment) // Uncomment and implement if you want to post comments
         log.Printf("PR #%d comment: %s", prNumber, comment)
     }
